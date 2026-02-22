@@ -1,0 +1,13 @@
+{
+  "$GMScript":"v1",
+  "%Name":"__Sketchy",
+  "isCompatibility":false,
+  "isDnD":false,
+  "name":"__Sketchy",
+  "parent":{
+    "name":"Sketchy",
+    "path":"folders/Extensions/Sketchy.yy",
+  },
+  "resourceType":"GMScript",
+  "resourceVersion":"2.0",
+}

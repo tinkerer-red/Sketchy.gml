@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "SketchyPre": {
+      "commandName": "Project",
+      "commandLineArgs": "\"C:\\Projects\\VisualStudio\\Sketchy.gml\\Example\\.\" --pre"
+    },
+    "SketchyPost": {
+      "commandName": "Project",
+      "commandLineArgs": "\"C:\\Projects\\VisualStudio\\Sketchy.gml\\Example\\.\" --post"
+    },
+    "SketchyClean": {
+      "commandName": "Project",
+      "commandLineArgs": "\"C:\\Projects\\VisualStudio\\Sketchy.gml\\Example\\.\" --clean"
+    }
+  }
+}
