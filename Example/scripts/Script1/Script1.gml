@@ -1,4 +1,4 @@
-
+/// @func const
 
 // ============================
 // MACRO TESTS (parameterized, nested, multi-line, single-line output)

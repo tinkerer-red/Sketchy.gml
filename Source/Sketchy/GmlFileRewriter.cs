@@ -100,8 +100,10 @@ namespace Sketchy
 
 				// Non-directive lines: expand macros + const replacements with scope stack.
 				string _expanded = ExpandLineWithScope(_line, _scope, _all_scopes[0]);
-				_out_lines[_line_index] = _expanded;
-				if (!ReferenceEquals(_expanded, _line) && _expanded != _line)
+				string _nullish = ApplyNullishOperatorTransform(_expanded);
+				string _closure = ApplyClosureTransform(_nullish);
+				_out_lines[_line_index] = _closure;
+				if (!ReferenceEquals(_closure, _line) && _closure != _line)
 				{
 					_did_modify = true;
 				}
@@ -109,6 +111,315 @@ namespace Sketchy
 
 			string _out_text = string.Join("\n", _out_lines);
 			return new ProcessResult(_did_modify, _out_text);
+		}
+
+		// --- Nullish Operator Transform ---
+		// Rewrites chained ?. accesses to bracket/hash or __struct_get_hashes as specified.
+		private static string ApplyNullishOperatorTransform(string line)
+		{
+			// Only process if ?. is present
+			if (!line.Contains("?."))
+				return line;
+
+			// This is a simple, line-based parser. For full correctness, a token-based approach is better,
+			// but for line-stable rewriting, we process only code regions and avoid comments/strings.
+
+			// We'll use a regex to find possible ?. chains, then process them.
+			// Example matches: struct?.key1, struct?.key1?.key2, struct.foo?.bar, etc.
+			// We'll process left-to-right, longest chains first.
+
+			// For simplicity, we'll use a manual scan here.
+			var sb = new System.Text.StringBuilder();
+			int i = 0;
+			while (i < line.Length)
+			{
+				// Look for ?. sequence
+				int qidx = line.IndexOf("?.", i, StringComparison.Ordinal);
+				if (qidx < 0)
+				{
+					sb.Append(line.Substring(i));
+					break;
+				}
+
+				// Copy up to the ?. occurrence
+				sb.Append(line.Substring(i, qidx - i));
+
+				// Find the start of the chain (identifier or property chain)
+				int start = qidx - 1;
+				while (start >= 0 && (char.IsLetterOrDigit(line[start]) || line[start] == '_' || line[start] == '.'))
+					start--;
+				start++;
+				string baseExpr = line.Substring(start, qidx - start);
+
+				// Now, parse the full chain of ?. and . accesses
+				int j = qidx;
+				var segments = new List<(bool nullish, string name)>();
+				// First segment is always nullish
+				while (j < line.Length)
+				{
+					if (line.Substring(j).StartsWith("?."))
+					{
+						int nameStart = j + 2;
+						int nameEnd = nameStart;
+						while (nameEnd < line.Length && (char.IsLetterOrDigit(line[nameEnd]) || line[nameEnd] == '_'))
+							nameEnd++;
+						string seg = line.Substring(nameStart, nameEnd - nameStart);
+						segments.Add((true, seg));
+						j = nameEnd;
+					}
+					else if (line[j] == '.' && j + 1 < line.Length && line[j + 1] != '.')
+					{
+						int nameStart = j + 1;
+						int nameEnd = nameStart;
+						while (nameEnd < line.Length && (char.IsLetterOrDigit(line[nameEnd]) || line[nameEnd] == '_'))
+							nameEnd++;
+						string seg = line.Substring(nameStart, nameEnd - nameStart);
+						segments.Add((false, seg));
+						j = nameEnd;
+					}
+					else
+					{
+						break;
+					}
+				}
+
+				// Determine how to rewrite
+				// Find the first non-nullish segment (if any)
+				int firstDot = segments.FindIndex(s => !s.nullish);
+				if (firstDot == 0)
+				{
+					// struct.foo?.bar... (dot first)
+					// Only rewrite the first nullish segment
+					sb.Append(baseExpr);
+					sb.Append('.');
+					sb.Append(segments[0].name);
+					for (int k = 1; k < segments.Count; k++)
+					{
+						if (segments[k].nullish)
+						{
+							sb.Append("[$ \"");
+							sb.Append(segments[k].name);
+							sb.Append("\"]");
+						}
+						else
+						{
+							sb.Append('.');
+							sb.Append(segments[k].name);
+						}
+					}
+				}
+				else if (firstDot > 0)
+				{
+					// struct?.foo.bar... (nullish, then dot)
+					sb.Append(baseExpr);
+					sb.Append("[$ \"");
+					sb.Append(segments[0].name);
+					sb.Append("\"]");
+					for (int k = 1; k < segments.Count; k++)
+					{
+						if (segments[k].nullish)
+						{
+							sb.Append("[$ \"");
+							sb.Append(segments[k].name);
+							sb.Append("\"]");
+						}
+						else
+						{
+							sb.Append('.');
+							sb.Append(segments[k].name);
+						}
+					}
+				}
+				else if (segments.All(s => s.nullish))
+				{
+					// All nullish: struct?.a?.b?.c
+					sb.Append("__struct_get_hashes(");
+					sb.Append(baseExpr);
+					foreach (var seg in segments)
+					{
+						sb.Append(", variable_get_hash(\"");
+						sb.Append(seg.name);
+						sb.Append("\")");
+					}
+					sb.Append(")");
+				}
+				else
+				{
+					// Fallback: just copy as-is
+					sb.Append(line.Substring(start, j - start));
+				}
+
+				i = j;
+			}
+			return sb.ToString();
+		}
+
+		// --- Closure Transform ---
+		// Rewrites closure(function(){...}) to the expanded form, capturing used variables.
+		private static string ApplyClosureTransform(string line)
+		{
+			// Only process if closure(function() is present
+			int idx = line.IndexOf("closure(function(", StringComparison.Ordinal);
+			if (idx < 0)
+				return line;
+
+			// Find the start of the function body
+			int funcStart = line.IndexOf("function(", idx, StringComparison.Ordinal);
+			if (funcStart < 0)
+				return line;
+			int braceIdx = line.IndexOf('{', funcStart);
+			if (braceIdx < 0)
+				return line;
+
+			// Find the matching closing brace for the function body
+			int depth = 1;
+			int end = braceIdx + 1;
+			while (end < line.Length && depth > 0)
+			{
+				if (line[end] == '{') depth++;
+				else if (line[end] == '}') depth--;
+				end++;
+			}
+			if (depth != 0) return line; // Unbalanced braces
+
+			string funcBody = line.Substring(braceIdx + 1, end - braceIdx - 2);
+
+			// Find variables used in the function body (excluding nested functions)
+			var usedVars = new HashSet<string>();
+			var declaredVars = new HashSet<string>();
+
+			// Tokenize for identifiers
+			var tokens = funcBody.Split(new[] { ' ', '\t', '\n', '\r', ';', ',', '(', ')', '[', ']', '.', '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^', '~', '?' }, StringSplitOptions.RemoveEmptyEntries);
+			foreach (var token in tokens)
+			{
+				if (token == "var" || token == "static" || token == "function" || token == "with" || token == "return" || token == "if" || token == "else" || token == "for" || token == "while" || token == "do" || token == "switch" || token == "case" || token == "break" || token == "continue")
+					continue;
+				if (token.StartsWith("__closure_"))
+					continue;
+				if (char.IsLetter(token[0]) || token[0] == '_')
+				{
+					usedVars.Add(token);
+				}
+			}
+
+			// Improved: Parse all var declarations (single-line, multi-line, comma-separated, with/without assignment)
+			int searchIdx = 0;
+			while (searchIdx < funcBody.Length)
+			{
+				// Look for 'var' keyword
+				int varIdx = funcBody.IndexOf("var", searchIdx, StringComparison.Ordinal);
+				if (varIdx < 0) break;
+				// Ensure it's a standalone word
+				bool isWord = (varIdx == 0 || !char.IsLetterOrDigit(funcBody[varIdx - 1])) && (varIdx + 3 >= funcBody.Length || !char.IsLetterOrDigit(funcBody[varIdx + 3]));
+				if (!isWord) { searchIdx = varIdx + 3; continue; }
+
+				int afterVar = varIdx + 3;
+				// Skip whitespace
+				while (afterVar < funcBody.Length && char.IsWhiteSpace(funcBody[afterVar])) afterVar++;
+				int declIdx = afterVar;
+				var nameBuilder = new StringBuilder();
+				while (declIdx < funcBody.Length)
+				{
+					char c = funcBody[declIdx];
+					if (char.IsLetter(c) || c == '_')
+					{
+						nameBuilder.Clear();
+						int nameStart = declIdx;
+						while (declIdx < funcBody.Length && (char.IsLetterOrDigit(funcBody[declIdx]) || funcBody[declIdx] == '_'))
+						{
+							nameBuilder.Append(funcBody[declIdx]);
+							declIdx++;
+						}
+						declaredVars.Add(nameBuilder.ToString());
+						// Skip whitespace
+						while (declIdx < funcBody.Length && char.IsWhiteSpace(funcBody[declIdx])) declIdx++;
+						// If next is =, skip initializer
+						if (declIdx < funcBody.Length && funcBody[declIdx] == '=')
+						{
+							declIdx++;
+							int depthParen = 0, depthBrace = 0, depthBracket = 0;
+							while (declIdx < funcBody.Length)
+							{
+								char cc = funcBody[declIdx];
+								if (cc == '(') depthParen++;
+								else if (cc == ')') depthParen--;
+								else if (cc == '{') depthBrace++;
+								else if (cc == '}') depthBrace--;
+								else if (cc == '[') depthBracket++;
+								else if (cc == ']') depthBracket--;
+								if (depthParen < 0 || depthBrace < 0 || depthBracket < 0) break;
+								// End of initializer: comma or semicolon at zero depth
+								if ((cc == ',' || cc == ';') && depthParen == 0 && depthBrace == 0 && depthBracket == 0) break;
+								declIdx++;
+							}
+						}
+						// If next is comma, continue to next var
+						if (declIdx < funcBody.Length && funcBody[declIdx] == ',')
+						{
+							declIdx++;
+							continue;
+						}
+						// If next is semicolon or newline, break
+						if (declIdx < funcBody.Length && (funcBody[declIdx] == ';' || funcBody[declIdx] == '\n' || funcBody[declIdx] == '\r'))
+						{
+							declIdx++;
+							break;
+						}
+					}
+					else if (c == ',' || c == ';')
+					{
+						declIdx++;
+						continue;
+					}
+					else if (char.IsWhiteSpace(c))
+					{
+						declIdx++;
+						continue;
+					}
+					else
+					{
+						// Unexpected char, break
+						break;
+					}
+				}
+				searchIdx = declIdx;
+			}
+			foreach (var d in declaredVars)
+				usedVars.Remove(d);
+
+			// Always include __closure_this
+			usedVars.Add("__closure_this");
+
+			// If only __closure_this is present, just return function as-is
+			if (usedVars.Count == 1)
+				return line.Substring(idx + 8, line.Length - (idx + 8)); // skip 'closure('
+
+			// Build the closure object and variable mapping
+			var closureObj = new System.Text.StringBuilder();
+			closureObj.Append("method({");
+			bool first = true;
+			foreach (var v in usedVars)
+			{
+				if (!first) closureObj.Append(", ");
+				closureObj.Append(v); closureObj.Append(": ");
+				closureObj.Append(v.StartsWith("__closure_") ? v : v.Replace("__closure_", ""));
+				first = false;
+			}
+			closureObj.Append("}, function(){");
+			// Map closure vars back to locals
+			foreach (var v in usedVars)
+			{
+				if (v == "__closure_this")
+					closureObj.Append("var __closure_this = __closure_this; ");
+				else
+					closureObj.Append($"var {v} = __closure_{v}; ");
+			}
+			closureObj.Append("with(__closure_this){");
+			closureObj.Append(funcBody);
+			closureObj.Append("}})");
+
+			// Replace the closure(function(){...}) call with the expanded version
+			return line.Substring(0, idx) + closureObj.ToString() + line.Substring(end);
 		}
 
 		private HashSet<int> CollectMacroDefinitionLines(string _file_path)
