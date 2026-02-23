@@ -1,10 +1,7 @@
 // This is only here to help with feather warnings in IDE
 
 /// @func const
-#macro const var
-
-/// @func closure
-#macro closure method_get_index
+//#macro const var
 
 #region jsDoc
 /// @ignore
